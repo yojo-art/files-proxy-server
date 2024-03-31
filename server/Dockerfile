@@ -16,4 +16,5 @@ FROM alpine:latest
 WORKDIR /root/
 COPY --from=0 /app/target/x86_64-unknown-linux-musl/release/server ./
 EXPOSE 8080
+EXPOSE 23725
 CMD ["./server"]
