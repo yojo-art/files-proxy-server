@@ -1,6 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, sync::{atomic::{AtomicBool, AtomicU32}, Arc}, time::Duration};
 
-use axum::{response::IntoResponse, routing::get, Router};
+use axum::{body::StreamBody, response::IntoResponse, routing::get, Router};
+use serde::Deserialize;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf},TcpStream}, sync::{mpsc::{error::TryRecvError, Receiver, Sender}, Mutex}};
 
 fn main() {
@@ -21,62 +22,101 @@ fn main() {
 			},
 		}
 	});
-	rt.block_on(async move{
-		let app = Router::new().route("/*path",get(|axum::extract::Path(path):axum::extract::Path<String>|async move{
-			//println!("{}",path);
-			let (send_result,mut recv_result)=tokio::sync::mpsc::channel(1);
-			let job=RequestJob{
-				localpath:path,
-				result:send_result,
-			};
-			match send_queue.send_timeout(job,Duration::from_millis(3000)).await{
-				Ok(_) => {
+	rt.block_on(http_server(http_addr,send_queue));
+}
+async fn http_server(http_addr: SocketAddr,send_queue: Sender<RequestJob>){
+	let client=reqwest::Client::new();
+	let app = Router::new().route("/*path",get(|axum::extract::Path(path):axum::extract::Path<String>|async move{
+		//println!("{}",path);
+		let (send_result,mut recv_result)=tokio::sync::mpsc::channel(1);
+		let job=RequestJob{
+			localpath:path,
+			result:send_result,
+		};
+		match send_queue.send_timeout(job,Duration::from_millis(3000)).await{
+			Ok(_) => {
+
+			},
+			Err(e) => {
+				let event_id=uuid::Uuid::new_v4().to_string();
+				eprintln!("EventId[{}] job send error {:?}",event_id,e);
+				let value=event_id.parse().unwrap();
+				let mut resp=(axum::http::StatusCode::TOO_MANY_REQUESTS,event_id).into_response();
+				resp.headers_mut().append("X-EventId",value);
+				return Err(resp);
+			},
+		}
+		let mut res=None;
+		for _ in 0..3000/5{
+			tokio::time::sleep(Duration::from_millis(5)).await;
+			match recv_result.try_recv(){
+				Ok(res0)=>{
+					res.replace(res0);
+					break;
+				},
+				Err(TryRecvError::Empty)=>{
 
 				},
-				Err(e) => {
-					let event_id=uuid::Uuid::new_v4().to_string();
-					eprintln!("EventId[{}] job send error {:?}",event_id,e);
-					let value=event_id.parse().unwrap();
-					let mut resp=(axum::http::StatusCode::TOO_MANY_REQUESTS,event_id).into_response();
-					resp.headers_mut().append("X-EventId",value);
-					return resp;
-				},
-			}
-			let mut res=None;
-			for _ in 0..3000/5{
-				tokio::time::sleep(Duration::from_millis(5)).await;
-				match recv_result.try_recv(){
-					Ok(res0)=>{
-						res.replace(res0);
-						break;
-					},
-					Err(TryRecvError::Empty)=>{
-
-					},
-					Err(TryRecvError::Disconnected)=>{
-						return (axum::http::StatusCode::GATEWAY_TIMEOUT,"").into_response();
-					}
+				Err(TryRecvError::Disconnected)=>{
+					return Err((axum::http::StatusCode::GATEWAY_TIMEOUT,"").into_response());
 				}
 			}
-			recv_result.close();
-			match res{
-				Some(res)=>{
-					match res.json{
-						Some(res)=>{
-							(axum::http::StatusCode::OK,res).into_response()
-						},
-						None=>{
-							(axum::http::StatusCode::NO_CONTENT).into_response()
+		}
+		recv_result.close();
+		match res{
+			Some(res)=>{
+				match res.json{
+					Some(res)=>{
+						let json=serde_json::from_str::<ResponseJson>(&res);
+						match json{
+							Ok(agent_data)=>{
+								let request=client.get(agent_data.uri).build();
+								match request{
+									Ok(request)=>{
+										let resp=client.execute(request).await;
+										match resp{
+											Ok(resp)=>{
+												let status=resp.status();
+												let body=StreamBody::new(resp.bytes_stream());
+												let mut headers=axum::headers::HeaderMap::new();
+												headers.append("X-RemoteStatus",status.as_u16().to_string().parse().unwrap());
+												if status.is_success(){
+													Ok((axum::http::StatusCode::OK,headers,body))
+												}else{
+													Ok((axum::http::StatusCode::BAD_GATEWAY,headers,body))
+												}
+											},
+											Err(e)=>{
+												Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
+											}
+										}
+									},
+									Err(e)=>{
+										Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
+									}
+								}
+							},
+							Err(e)=>{
+								let event_id=uuid::Uuid::new_v4().to_string();
+								eprintln!("EventId[{}] job Agent Json Parse error {:?}",event_id,e);
+								let value=event_id.parse().unwrap();
+								let mut resp=(axum::http::StatusCode::BAD_GATEWAY,event_id).into_response();
+								resp.headers_mut().append("X-EventId",value);
+								Err(resp)
+							}
 						}
+					},
+					None=>{
+						Err((axum::http::StatusCode::NO_CONTENT).into_response())
 					}
-				},
-				None=>{
-					(axum::http::StatusCode::GATEWAY_TIMEOUT,"").into_response()
 				}
+			},
+			None=>{
+				Err((axum::http::StatusCode::GATEWAY_TIMEOUT,"").into_response())
 			}
-		}));
-		axum::Server::bind(&http_addr).serve(app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
-	});
+		}
+	}));
+	axum::Server::bind(&http_addr).serve(app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }
 async fn agent_worker((tcp,_addr):(TcpStream,SocketAddr),mut recv_queue:Receiver<RequestJob>)->Receiver<RequestJob>{
 	println!("start agent session");
@@ -195,4 +235,8 @@ struct AgentResult{
 	id:u32,
 	status:u16,
 	json:Option<String>,
+}
+#[derive(Deserialize,Debug)]
+struct ResponseJson{
+	uri:String,
 }
