@@ -179,9 +179,18 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 			Err(e)=>return Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
 		};
 		let status=resp.status();
-		let body=StreamBody::new(resp.bytes_stream());
+		let remote_headers=resp.headers();
 		let mut headers=axum::headers::HeaderMap::new();
 		headers.append("X-RemoteStatus",status.as_u16().to_string().parse().unwrap());
+		fn add_remote_header(key:&'static str,headers:&mut axum::headers::HeaderMap,remote_headers:&reqwest::header::HeaderMap){
+			if let Some(v)=remote_headers.get(key){
+				headers.append(key,String::from_utf8_lossy(v.as_bytes()).parse().unwrap());
+			}
+		}
+		add_remote_header("Content-Disposition",&mut headers,remote_headers);
+		add_remote_header("Content-Security-Policy",&mut headers,remote_headers);
+		add_remote_header("Content-Type",&mut headers,remote_headers);
+		let body=StreamBody::new(resp.bytes_stream());
 		if status.is_success(){
 			Ok((axum::http::StatusCode::OK,headers,body))
 		}else{
