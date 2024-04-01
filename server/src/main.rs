@@ -63,57 +63,43 @@ async fn http_server(http_addr: SocketAddr,send_queue: Sender<RequestJob>){
 			}
 		}
 		recv_result.close();
-		match res{
-			Some(res)=>{
-				match res.json{
-					Some(res)=>{
-						let json=serde_json::from_str::<ResponseJson>(&res);
-						match json{
-							Ok(agent_data)=>{
-								let request=client.get(agent_data.uri).build();
-								match request{
-									Ok(request)=>{
-										let resp=client.execute(request).await;
-										match resp{
-											Ok(resp)=>{
-												let status=resp.status();
-												let body=StreamBody::new(resp.bytes_stream());
-												let mut headers=axum::headers::HeaderMap::new();
-												headers.append("X-RemoteStatus",status.as_u16().to_string().parse().unwrap());
-												if status.is_success(){
-													Ok((axum::http::StatusCode::OK,headers,body))
-												}else{
-													Ok((axum::http::StatusCode::BAD_GATEWAY,headers,body))
-												}
-											},
-											Err(e)=>{
-												Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
-											}
-										}
-									},
-									Err(e)=>{
-										Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
-									}
-								}
-							},
-							Err(e)=>{
-								let event_id=uuid::Uuid::new_v4().to_string();
-								eprintln!("EventId[{}] job Agent Json Parse error {:?}",event_id,e);
-								let value=event_id.parse().unwrap();
-								let mut resp=(axum::http::StatusCode::BAD_GATEWAY,event_id).into_response();
-								resp.headers_mut().append("X-EventId",value);
-								Err(resp)
-							}
-						}
-					},
-					None=>{
-						Err((axum::http::StatusCode::NO_CONTENT).into_response())
-					}
-				}
-			},
-			None=>{
-				Err((axum::http::StatusCode::GATEWAY_TIMEOUT,"").into_response())
+		let res=match res{
+			Some(res)=>res,
+			None=>return Err((axum::http::StatusCode::GATEWAY_TIMEOUT,"").into_response())
+		};
+		if res.json.is_none(){
+			return Err((axum::http::StatusCode::NO_CONTENT).into_response());
+		};
+		let json=serde_json::from_str::<ResponseJson>(&res.json.as_ref().unwrap());
+		let json=match json{
+			Ok(data)=>data,
+			Err(e)=>{
+				let event_id=uuid::Uuid::new_v4().to_string();
+				eprintln!("EventId[{}] job Agent Json Parse error {:?}",event_id,e);
+				let value=event_id.parse().unwrap();
+				let mut resp=(axum::http::StatusCode::BAD_GATEWAY,event_id).into_response();
+				resp.headers_mut().append("X-EventId",value);
+				return Err(resp);
 			}
+		};
+		let request=client.get(json.uri).build();
+		let request=match request{
+			Ok(request)=>request,
+			Err(e)=>return Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
+		};
+		let resp=client.execute(request).await;
+		let resp=match resp{
+			Ok(resp)=>resp,
+			Err(e)=>return Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
+		};
+		let status=resp.status();
+		let body=StreamBody::new(resp.bytes_stream());
+		let mut headers=axum::headers::HeaderMap::new();
+		headers.append("X-RemoteStatus",status.as_u16().to_string().parse().unwrap());
+		if status.is_success(){
+			Ok((axum::http::StatusCode::OK,headers,body))
+		}else{
+			Ok((axum::http::StatusCode::BAD_GATEWAY,headers,body))
 		}
 	}));
 	axum::Server::bind(&http_addr).serve(app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
