@@ -26,7 +26,9 @@ fn main() {
 }
 async fn http_server(http_addr: SocketAddr,send_queue: Sender<RequestJob>){
 	let client=reqwest::Client::new();
-	let app = Router::new().route("/*path",get(|axum::extract::Path(path):axum::extract::Path<String>|async move{
+	let app = Router::new().route("/",get(||async move{
+		axum::http::StatusCode::NO_CONTENT
+	})).route("/*path",get(|axum::extract::Path(path):axum::extract::Path<String>|async move{
 		//println!("{}",path);
 		let (send_result,mut recv_result)=tokio::sync::mpsc::channel(1);
 		let job=RequestJob{
