@@ -13,8 +13,12 @@ ENV SCCACHE_DIR=/var/cache/sccache
 RUN --mount=type=cache,target=/var/cache/cargo --mount=type=cache,target=/var/cache/sccache cargo build --target x86_64-unknown-linux-musl --release --offline
 
 FROM alpine:latest
-WORKDIR /root/
-COPY --from=0 /app/target/x86_64-unknown-linux-musl/release/server ./
+ARG UID="851"
+ARG GID="851"
+RUN addgroup -g "${GID}" proxy && adduser -u "${UID}" -G proxy -D -h /files-proxy -s /bin/sh proxy
+WORKDIR /files-proxy
+USER proxy
+COPY --from=0 /app/target/x86_64-unknown-linux-musl/release/server ./files-proxy
 EXPOSE 8080
 EXPOSE 23725
-CMD ["./server"]
+CMD ["./files-proxy"]
