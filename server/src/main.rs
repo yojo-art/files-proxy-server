@@ -127,6 +127,7 @@ async fn http_server(http_addr: SocketAddr,send_queue: Arc<Sender<RequestJob>>){
 				return Err(resp);
 			}
 		};
+		println!("GET {}",json.uri);
 		let request=client.get(json.uri).build();
 		let request=match request{
 			Ok(request)=>request,
