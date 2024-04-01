@@ -1,35 +1,65 @@
-use std::{collections::HashMap, net::SocketAddr, sync::{atomic::{AtomicBool, AtomicU32}, Arc}, time::Duration};
+use std::{collections::HashMap, io::Write, net::SocketAddr, sync::{atomic::{AtomicBool, AtomicU32}, Arc}, time::Duration};
 
 use axum::{body::StreamBody, response::IntoResponse, routing::get, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf},TcpStream}, sync::{mpsc::{error::TryRecvError, Receiver, Sender}, Mutex}};
 
+#[derive(Serialize,Deserialize,Debug)]
+struct ConfigFile{
+	http_bind_addr:String,//0.0.0.0:8080
+	agent_bind_addr:String,//0.0.0.0:23725
+	ping_wait_ms:u64,//0でping無し 標準30000
+	ping_worker_timeout:u32,//3000
+	ping_worker_poll:u16,//5
+	http_agentwait_timeout:u32,//3000
+	http_agentwait_poll:u16,//5
+	agent_queue_send_poll:u16,//5
+}
+
 fn main() {
-	let (send_queue,mut recv_queue)=tokio::sync::mpsc::channel::<RequestJob>(4);
-	let http_addr = SocketAddr::from(([0, 0, 0, 0],8080));
-	let tcp_addr = SocketAddr::from(([0, 0, 0, 0],23725));
+	if !std::path::Path::new("config.json").exists(){
+		let default_config=ConfigFile{
+			http_bind_addr: "0.0.0.0:8080".to_owned(),
+			agent_bind_addr: "0.0.0.0:23725".to_owned(),
+			ping_wait_ms: 30000,
+			ping_worker_timeout: 3000,
+			ping_worker_poll: 5,
+			http_agentwait_timeout: 3000,
+			http_agentwait_poll: 5,
+			agent_queue_send_poll: 5,
+		};
+		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
+		std::fs::File::create("config.json").unwrap().write_all(default_config.as_bytes()).unwrap();
+	}
+	let config:ConfigFile=serde_json::from_reader(std::fs::File::open("config.json").unwrap()).unwrap();
+	let config=Arc::new(config);
+	let (send_queue,recv_queue)=tokio::sync::mpsc::channel::<RequestJob>(4);
 	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-	rt.spawn(async move{
+	async fn tcp_listener(config:Arc<ConfigFile>,mut recv_queue:Receiver<RequestJob>){
+		let tcp_addr:SocketAddr = config.agent_bind_addr.parse().unwrap();
 		match tokio::net::TcpListener::bind(tcp_addr).await{
 			Ok(con) => {
 				loop{
 					let stream=con.accept().await;
-					recv_queue=agent_worker(stream.unwrap(),recv_queue).await;
+					recv_queue=agent_worker(stream.unwrap(),recv_queue,config.clone()).await;
 				}
 			},
 			Err(e) => {
 				eprintln!("{:?}",e);
 			},
 		}
-	});
+	}
+	rt.spawn(tcp_listener(config.clone(),recv_queue));
 	let send_queue=Arc::new(send_queue);
-	let send_queue0=send_queue.clone();
-	rt.spawn(ping_worker(send_queue0));
-	rt.block_on(http_server(http_addr,send_queue));
+	if config.ping_wait_ms>0{
+		let send_queue0=send_queue.clone();
+		rt.spawn(ping_worker(send_queue0,config.clone()));
+	}
+	rt.block_on(http_server(send_queue,config));
 }
-async fn ping_worker(send_queue: Arc<Sender<RequestJob>>){
+async fn ping_worker(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>){
 	loop{
-		tokio::time::sleep(Duration::from_secs(30)).await;
+		tokio::time::sleep(Duration::from_millis(config.ping_wait_ms)).await;
 		let start_time=tokio::time::Instant::now();
 		let (send_result,mut recv_result)=tokio::sync::mpsc::channel(1);
 		if let Err(e)=send_queue.send(RequestJob{
@@ -40,14 +70,14 @@ async fn ping_worker(send_queue: Arc<Sender<RequestJob>>){
 			eprintln!("Agent Ping {}",e);
 		}
 		let mut res=None;
-		for _ in 0..3000/5{
+		for _ in 0..config.ping_worker_timeout as i64/config.ping_worker_poll as i64{
 			match recv_result.try_recv(){
 				Ok(res0)=>{
 					res.replace(res0);
 					break;
 				},
 				Err(TryRecvError::Empty)=>{
-					tokio::time::sleep(Duration::from_millis(5)).await;
+					tokio::time::sleep(Duration::from_millis(config.ping_worker_poll.into())).await;
 				},
 				Err(TryRecvError::Disconnected)=>{
 					eprintln!("Agent Ping Disconnected");
@@ -60,7 +90,8 @@ async fn ping_worker(send_queue: Arc<Sender<RequestJob>>){
 		println!("LastAgentPing {}ms {}",ping_time.as_millis(),is_ok);
 	}
 }
-async fn http_server(http_addr: SocketAddr,send_queue: Arc<Sender<RequestJob>>){
+async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>){
+	let http_addr:SocketAddr = config.http_bind_addr.parse().unwrap();
 	let client=reqwest::Client::new();
 	let app = Router::new().route("/",get(||async move{
 		axum::http::StatusCode::NO_CONTENT
@@ -93,14 +124,14 @@ async fn http_server(http_addr: SocketAddr,send_queue: Arc<Sender<RequestJob>>){
 			},
 		}
 		let mut res=None;
-		for _ in 0..3000/5{
+		for _ in 0..config.http_agentwait_timeout as i64/config.http_agentwait_poll as i64{
 			match recv_result.try_recv(){
 				Ok(res0)=>{
 					res.replace(res0);
 					break;
 				},
 				Err(TryRecvError::Empty)=>{
-					tokio::time::sleep(Duration::from_millis(5)).await;
+					tokio::time::sleep(Duration::from_millis(config.http_agentwait_poll.into())).await;
 				},
 				Err(TryRecvError::Disconnected)=>{
 					return Err((axum::http::StatusCode::GATEWAY_TIMEOUT,"").into_response());
@@ -112,6 +143,15 @@ async fn http_server(http_addr: SocketAddr,send_queue: Arc<Sender<RequestJob>>){
 			Some(res)=>res,
 			None=>return Err((axum::http::StatusCode::GATEWAY_TIMEOUT,"").into_response())
 		};
+		if res.status!=200{
+			let event_id=uuid::Uuid::new_v4().to_string();
+			eprintln!("EventId[{}] job Agent Status {}",event_id,res.status);
+			let value=event_id.parse().unwrap();
+			let mut resp=(axum::http::StatusCode::BAD_GATEWAY).into_response();
+			resp.headers_mut().append("X-EventId",value);
+			resp.headers_mut().append("X-AgentStatus",res.status.to_string().parse().unwrap());
+			return Err(resp);
+		}
 		if res.json.is_none(){
 			return Err((axum::http::StatusCode::NO_CONTENT).into_response());
 		};
@@ -127,6 +167,7 @@ async fn http_server(http_addr: SocketAddr,send_queue: Arc<Sender<RequestJob>>){
 				return Err(resp);
 			}
 		};
+		println!("GET {}",json.uri);
 		let request=client.get(json.uri).build();
 		let request=match request{
 			Ok(request)=>request,
@@ -149,7 +190,7 @@ async fn http_server(http_addr: SocketAddr,send_queue: Arc<Sender<RequestJob>>){
 	}));
 	axum::Server::bind(&http_addr).serve(app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }
-async fn agent_worker((tcp,_addr):(TcpStream,SocketAddr),mut recv_queue:Receiver<RequestJob>)->Receiver<RequestJob>{
+async fn agent_worker((tcp,_addr):(TcpStream,SocketAddr),mut recv_queue:Receiver<RequestJob>,config:Arc<ConfigFile>)->Receiver<RequestJob>{
 	println!("start agent session");
 	let id=AtomicU32::new(0);
 	async fn req(con:&mut OwnedWriteHalf,req:&RequestJob,id:u32)->Result<(),std::io::Error>{
@@ -232,7 +273,7 @@ async fn agent_worker((tcp,_addr):(TcpStream,SocketAddr),mut recv_queue:Receiver
 				},
 				Err(TryRecvError::Empty)=>{
 					//job wait
-					tokio::time::sleep(Duration::from_millis(5)).await;
+					tokio::time::sleep(Duration::from_millis(config.agent_queue_send_poll.into())).await;
 				},
 				Err(TryRecvError::Disconnected)=>{
 					break;
