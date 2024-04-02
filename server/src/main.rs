@@ -17,6 +17,7 @@ struct ConfigFile{
 	http_agentwait_timeout:u32,//3000
 	http_agentwait_poll:u16,//5
 	agent_queue_send_poll:u16,//5
+	user_agent:Option<String>,
 }
 
 fn main() {
@@ -42,6 +43,7 @@ fn main() {
 			http_agentwait_timeout: 3000,
 			http_agentwait_poll: 5,
 			agent_queue_send_poll: 5,
+			user_agent: Some("https://github.com/yojo-art/files-proxy".to_owned()),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -178,7 +180,10 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 	let client=reqwest::Client::new();
 	let app = Router::new().route("/",get(||async move{
 		axum::http::StatusCode::NO_CONTENT
-	})).route("/*path",get(|axum::extract::Path(path):axum::extract::Path<String>|async move{
+	})).route("/*path",get(|
+		axum::extract::Path(path):axum::extract::Path<String>,
+		headers: axum::http::HeaderMap,
+		|async move{
 		let mut json=if let Some(redis_client)=redis_client.as_ref(){
 			let mut redis_client=redis_client.lock().await;
 			let value:Option<String>=redis_client.get(&path).ok();
@@ -195,13 +200,13 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 				Some(res)=>res,
 				None=>return Err((axum::http::StatusCode::GATEWAY_TIMEOUT,"").into_response())
 			};
+			let res_json=match res.status{
+				200=>res.json.or(Some(String::new())),
+				204=>Some(String::new()),
+				_=>None
+			};
 			if let Some(redis_client)=redis_client.as_ref(){
 				let mut redis_client=redis_client.lock().await;
-				let res_json=match res.status{
-					200=>res.json.or(Some(String::new())),
-					204=>Some(String::new()),
-					_=>None
-				};
 				if let Some(res_json)=res_json.as_ref(){
 					let res=match config.redis_ttl{
 						Some(ttl_seconds)=>{
@@ -220,8 +225,8 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 						}
 					}
 				}
-				json=res_json;
 			}
+			json=res_json;
 			if res.status!=200{
 				let event_id=uuid::Uuid::new_v4().to_string();
 				eprintln!("EventId[{}] job Agent Status {}",event_id,res.status);
@@ -252,11 +257,21 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 			}
 		};
 		println!("GET {}",json.uri);
-		let request=client.get(json.uri).build();
-		let request=match request{
+		let request=client.get(&json.uri).build();
+		let mut request=match request{
 			Ok(request)=>request,
 			Err(e)=>return Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
 		};
+		let req_headers=request.headers_mut();
+		if let Some(modified_since)=headers.get("If-Modified-Since").map(|v|v.to_str().ok()).unwrap_or(None){
+			req_headers.append("If-Modified-Since",modified_since.parse().unwrap());
+		}
+		if let Some(modified_since)=headers.get("If-None-Match").map(|v|v.to_str().ok()).unwrap_or(None){
+			req_headers.append("If-None-Match",modified_since.parse().unwrap());
+		}
+		if let Some(user_agent)=config.user_agent.as_ref(){
+			req_headers.append("User-Agent",user_agent.parse().unwrap());
+		}
 		let resp=client.execute(request).await;
 		let resp=match resp{
 			Ok(resp)=>resp,
@@ -266,17 +281,24 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 		let remote_headers=resp.headers();
 		let mut headers=axum::headers::HeaderMap::new();
 		headers.append("X-RemoteStatus",status.as_u16().to_string().parse().unwrap());
+		headers.append("X-RemoteURL",json.uri.parse().unwrap());
+		headers.append("Vary","Origin".parse().unwrap());
 		fn add_remote_header(key:&'static str,headers:&mut axum::headers::HeaderMap,remote_headers:&reqwest::header::HeaderMap){
-			if let Some(v)=remote_headers.get(key){
+			for v in remote_headers.get_all(key){
 				headers.append(key,String::from_utf8_lossy(v.as_bytes()).parse().unwrap());
 			}
 		}
 		add_remote_header("Content-Disposition",&mut headers,remote_headers);
 		add_remote_header("Content-Security-Policy",&mut headers,remote_headers);
 		add_remote_header("Content-Type",&mut headers,remote_headers);
+		add_remote_header("Cache-Control",&mut headers,remote_headers);
+		add_remote_header("Last-Modified",&mut headers,remote_headers);
+		add_remote_header("Etag",&mut headers,remote_headers);
 		let body=StreamBody::new(resp.bytes_stream());
 		if status.is_success(){
 			Ok((axum::http::StatusCode::OK,headers,body))
+		}else if status==reqwest::StatusCode::NOT_MODIFIED{
+			Ok((axum::http::StatusCode::NOT_MODIFIED,headers,body))
 		}else{
 			Ok((axum::http::StatusCode::BAD_GATEWAY,headers,body))
 		}
