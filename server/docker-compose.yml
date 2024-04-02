@@ -3,7 +3,7 @@ version: "3"
 services:
   server:
     build: .
-    restart: none
+    restart: always
     links:
       - redis
     depends_on:
@@ -19,6 +19,10 @@ services:
       - external_network
     volumes:
       - ./docker-config:/config:ro
+    healthcheck:
+      test: "./files-proxy ping"
+      interval: 10s
+      retries: 3
 
   redis:
     restart: always

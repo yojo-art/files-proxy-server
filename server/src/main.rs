@@ -4,9 +4,10 @@ use axum::{body::StreamBody, response::IntoResponse, routing::get, Router};
 use redis::Commands;
 use serde::{Deserialize, Serialize};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf},TcpStream}, sync::{mpsc::{error::TryRecvError, Receiver, Sender}, Mutex}};
+mod commands;
 
 #[derive(Serialize,Deserialize,Debug)]
-struct ConfigFile{
+pub(crate) struct ConfigFile{
 	redis_addr:Option<String>,//redis://127.0.0.1:6379
 	redis_ttl:Option<u64>,//3600=1h
 	http_bind_addr:String,//0.0.0.0:8080
@@ -49,6 +50,12 @@ fn main() {
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
 	}
 	let config:ConfigFile=serde_json::from_reader(std::fs::File::open(&config_path).unwrap()).unwrap();
+
+	let args: Vec<String> = std::env::args().collect();
+	if let Some(subcommand)=args.get(1).cloned(){
+		commands::cli(subcommand,args,config);
+		return;
+	}
 	let config=Arc::new(config);
 	let (send_queue,recv_queue)=tokio::sync::mpsc::channel::<RequestJob>(4);
 	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
@@ -77,35 +84,39 @@ fn main() {
 async fn ping_worker(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>){
 	loop{
 		tokio::time::sleep(Duration::from_millis(config.ping_wait_ms)).await;
-		let start_time=tokio::time::Instant::now();
-		let (send_result,mut recv_result)=tokio::sync::mpsc::channel(1);
-		if let Err(e)=send_queue.send(RequestJob{
-			type_id:3,
-			localpath: None,
-			result:Some(send_result),
-		}).await{
-			eprintln!("Agent Ping {}",e);
-		}
-		let mut res=None;
-		for _ in 0..config.ping_worker_timeout as i64/config.ping_worker_poll as i64{
-			match recv_result.try_recv(){
-				Ok(res0)=>{
-					res.replace(res0);
-					break;
-				},
-				Err(TryRecvError::Empty)=>{
-					tokio::time::sleep(Duration::from_millis(config.ping_worker_poll.into())).await;
-				},
-				Err(TryRecvError::Disconnected)=>{
-					eprintln!("Agent Ping Disconnected");
-					break;
-				}
+		let (ping_time,is_ok)=agent_ping(&send_queue,&config).await;
+		let is_ok=if is_ok{"ok"}else{"error"};
+		println!("LastAgentPing {}ms {}",ping_time,is_ok);
+	}
+}
+async fn agent_ping(send_queue: &Sender<RequestJob>,config:&ConfigFile)->(u64,bool){
+	let start_time=tokio::time::Instant::now();
+	let (send_result,mut recv_result)=tokio::sync::mpsc::channel(1);
+	if let Err(e)=send_queue.send(RequestJob{
+		type_id:3,
+		localpath: None,
+		result:Some(send_result),
+	}).await{
+		eprintln!("Agent Ping {}",e);
+	}
+	let mut res=None;
+	for _ in 0..config.ping_worker_timeout as i64/config.ping_worker_poll as i64{
+		match recv_result.try_recv(){
+			Ok(res0)=>{
+				res.replace(res0);
+				break;
+			},
+			Err(TryRecvError::Empty)=>{
+				tokio::time::sleep(Duration::from_millis(config.ping_worker_poll.into())).await;
+			},
+			Err(TryRecvError::Disconnected)=>{
+				eprintln!("Agent Ping Disconnected");
+				break;
 			}
 		}
-		let ping_time=tokio::time::Instant::now()-start_time;
-		let is_ok=res.as_ref().map(|_|"ok").unwrap_or("error");
-		println!("LastAgentPing {}ms {}",ping_time.as_millis(),is_ok);
 	}
+	let ping_time=tokio::time::Instant::now()-start_time;
+	(ping_time.as_millis() as u64,res.is_some())
 }
 async fn agent_call(send_queue: Arc<Sender<RequestJob>>,config:&ConfigFile,path:String)->Result<Option<AgentResult>,axum::response::Response>{
 	let type_id=if path.starts_with("webpublic-"){
@@ -178,8 +189,18 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 	let redis_client=redis_client.map(|v|Arc::new(Mutex::new(v)));
 	let http_addr:SocketAddr = config.http_bind_addr.parse().unwrap();
 	let client=reqwest::Client::new();
+	let config0=config.clone();
+	let send_queue0=send_queue.clone();
 	let app = Router::new().route("/",get(||async move{
 		axum::http::StatusCode::NO_CONTENT
+	})).route("/ping",get(||async move{
+		let (ms,ok)=agent_ping(&send_queue0,&config0).await;
+		let json=PingStatus{
+			ms,ok
+		};
+		let mut header=axum::headers::HeaderMap::new();
+		header.insert("Content-Type","application/json".parse().unwrap());
+		(axum::http::StatusCode::OK,header,serde_json::to_string(&json).unwrap())
 	})).route("/*path",get(|
 		axum::extract::Path(path):axum::extract::Path<String>,
 		headers: axum::http::HeaderMap,
@@ -432,4 +453,9 @@ struct AgentResult{
 #[derive(Deserialize,Debug)]
 struct ResponseJson{
 	uri:String,
+}
+#[derive(Serialize,Deserialize,Debug)]
+pub(crate) struct PingStatus{
+	ms:u64,
+	ok:bool,
 }
