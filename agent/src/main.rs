@@ -4,11 +4,12 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedW
 
 #[derive(Deserialize,Debug)]
 struct ConfigFile{
-	pg_user:String,
-	pg_pass:String,
-	pg_host:String,
-	pg_port:u16,
-	pg_database:String,
+	pg_user:Option<String>,
+	pg_pass:Option<String>,
+	pg_host:Option<String>,
+	pg_port:Option<u16>,
+	pg_database:Option<String>,
+	database_url:Option<String>,
 	tcp_host:String,
 	tcp_port:u16,
 }
@@ -44,7 +45,15 @@ fn main() {
 		Err(_)=>"config.json".to_owned()
 	};
 	let config:ConfigFile=serde_json::from_reader(std::fs::File::open(config_path).unwrap()).unwrap();
-	let database_url = format!("postgresql://{}:{}@{}:{}/{}",config.pg_user,config.pg_pass,config.pg_host,config.pg_port,config.pg_database);
+	let database_url = match std::env::var("DATABASE_URL"){
+		Ok(url)=>url,
+		Err(_)=>{
+			match config.database_url{
+				Some(url)=>url,
+				None=>format!("postgresql://{}:{}@{}:{}/{}",config.pg_user.unwrap(),config.pg_pass.unwrap(),config.pg_host.unwrap(),config.pg_port.unwrap(),config.pg_database.unwrap())
+			}
+		}
+	};
 	let (req_sender,mut req_receiver)=tokio::sync::mpsc::channel(2);
 	let (res_sender,mut res_receiver)=tokio::sync::mpsc::channel(2);
 
