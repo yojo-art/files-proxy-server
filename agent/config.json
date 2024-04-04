@@ -1,0 +1,9 @@
+{
+	"pg_user":"example-cherrypick-user",
+	"pg_pass":"example-cherrypick-pass",
+	"pg_host":"localhost",
+	"pg_port":5432,
+	"pg_database":"cherrypick",
+	"tcp_host":"localhost",
+	"tcp_port":23725
+}
