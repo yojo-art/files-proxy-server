@@ -140,9 +140,31 @@ async fn tcp_worker(tcp:TcpStream,req_sender: Sender<Request>,res_sender: Sender
 	println!("End Connection");
 }
 async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
+	fn single_string_body(req:&Request)->Result<String,Response>{
+		let name=match String::from_utf8(req.body[2..].to_vec()){
+			Ok(s)=>s,
+			Err(_)=>return Err(Response{
+				status:400,
+				id:req.id,
+				json:None,
+			})
+		};
+		if name.is_empty() {
+			Err(Response{
+				status:400,
+				id:req.id,
+				json:None,
+			})
+		}else{
+			Ok(name)
+		}
+	}
 	let file = match req.request_type{
 		1=>{
-			let name=String::from_utf8_lossy(&req.body[2..]);
+			let name=match single_string_body(&req){
+				Ok(s)=>s,
+				Err(e)=>return e,
+			};
 			sqlx::query_as::<_, DriveFile>(
 				"
 				SELECT \"thumbnailAccessKey\",\"webpublicAccessKey\",\"isLink\",src
@@ -150,11 +172,14 @@ async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
 				WHERE \"webpublicAccessKey\" = $1
 				",
 			)
-			.bind(name.as_ref())
+			.bind(&name)
 			.fetch_one(pool).await
 		},
 		2=>{
-			let name=String::from_utf8_lossy(&req.body[2..]);
+			let name=match single_string_body(&req){
+				Ok(s)=>s,
+				Err(e)=>return e,
+			};
 			sqlx::query_as::<_, DriveFile>(
 				"
 				SELECT \"thumbnailAccessKey\",\"webpublicAccessKey\",\"isLink\",src
@@ -162,7 +187,7 @@ async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
 				WHERE \"thumbnailAccessKey\" = $1
 				",
 			)
-			.bind(name.as_ref())
+			.bind(&name)
 			.fetch_one(pool).await
 		}
 		3=>{
@@ -173,7 +198,10 @@ async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
 			}
 		},
 		4=>{
-			let name=String::from_utf8_lossy(&req.body[2..]);
+			let name=match single_string_body(&req){
+				Ok(s)=>s,
+				Err(e)=>return e,
+			};
 			sqlx::query_as::<_, DriveFile>(
 				"
 				SELECT \"thumbnailAccessKey\",\"webpublicAccessKey\",\"isLink\",src
@@ -181,7 +209,7 @@ async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
 				WHERE \"accessKey\" = $1
 				",
 			)
-			.bind(name.as_ref())
+			.bind(&name)
 			.fetch_one(pool).await
 		},
 		_=>{
@@ -204,10 +232,27 @@ async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
 		},
 		Err(e)=>{
 			eprintln!("{}",e);
-			Response{
-				status:500,
-				id:req.id,
-				json:None
+			match e{
+				sqlx::Error::RowNotFound => Response{
+					status:404,
+					id:req.id,
+					json:None
+				},
+				sqlx::Error::PoolClosed => Response{
+					status:503,
+					id:req.id,
+					json:None
+				},
+				sqlx::Error::PoolTimedOut => Response{
+					status:504,
+					id:req.id,
+					json:None
+				},
+				_ => Response{
+					status:500,
+					id:req.id,
+					json:None
+				},
 			}
 		}
 	}
