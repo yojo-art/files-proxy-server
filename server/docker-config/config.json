@@ -8,5 +8,7 @@
   "ping_worker_poll": 5,
   "http_agentwait_timeout": 3000,
   "http_agentwait_poll": 5,
-  "agent_queue_send_poll": 5
+  "agent_queue_send_poll": 5,
+  "local_media_url":null,
+  "user_agent": "https://github.com/yojo-art/files-proxy"
 }
