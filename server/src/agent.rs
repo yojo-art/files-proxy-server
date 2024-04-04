@@ -110,10 +110,7 @@ impl AgentWorker{
 		//println!("eventid {}",id);
 		let len=con.read_u16().await? as usize;
 		let s=if len>0{
-			let mut buf=Vec::with_capacity(len);
-			unsafe{
-				buf.set_len(len);
-			}
+			let mut buf=vec![0;len];
 			con.read_exact(&mut buf).await?;
 			String::from_utf8(buf).map(|s|Some(s)).unwrap_or_else(|_|None)
 		}else{

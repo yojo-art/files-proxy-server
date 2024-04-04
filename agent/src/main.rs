@@ -97,11 +97,8 @@ async fn tcp_worker(tcp:TcpStream,req_sender: Sender<Request>,res_sender: Sender
 			let reserved=reader.read_u8().await?;
 			let id=reader.read_u32().await?;
 			let body_len=reader.read_u16().await? as usize;
-			let mut body=Vec::with_capacity(body_len);
+			let mut body=vec![0;body_len];
 			if body_len>0{
-				unsafe{
-					body.set_len(body_len);
-				}
 				reader.read_exact(&mut body).await?;
 			}
 			Ok(Request{
