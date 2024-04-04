@@ -1,43 +1,73 @@
-use std::{collections::HashMap, net::SocketAddr, sync::{atomic::{AtomicBool, AtomicU32}, Arc}, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::{atomic::AtomicU32, Arc}};
 
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream}, sync::{mpsc::{error::TryRecvError, Receiver, Sender}, Mutex}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream}, sync::{mpsc::Sender, Mutex, RwLock}};
 
 use crate::{AgentResult, ConfigFile, RequestJob};
 
-
-pub(crate) async fn agent_ping(send_queue: &Sender<RequestJob>,config:&ConfigFile)->(u64,bool){
-	let start_time=tokio::time::Instant::now();
-	let (send_result,mut recv_result)=tokio::sync::mpsc::channel(1);
-	if let Err(e)=send_queue.send(RequestJob{
-		type_id:3,
-		localpath: None,
-		result:Some(send_result),
-	}).await{
-		eprintln!("Agent Ping {}",e);
-	}
-	let mut res=None;
-	for _ in 0..config.ping_worker_timeout as i64/config.ping_worker_poll as i64{
-		match recv_result.try_recv(){
-			Ok(res0)=>{
-				res.replace(res0);
-				break;
-			},
-			Err(TryRecvError::Empty)=>{
-				tokio::time::sleep(Duration::from_millis(config.ping_worker_poll.into())).await;
-			},
-			Err(TryRecvError::Disconnected)=>{
-				eprintln!("Agent Ping Disconnected");
-				break;
-			}
+pub(crate) struct AgentJobManager{
+	config:Arc<ConfigFile>,
+	workers:RwLock<Vec<Arc<AgentWorker>>>,
+}
+impl AgentJobManager{
+	pub fn new(config:Arc<ConfigFile>)->Self{
+		Self{
+			config,
+			workers:RwLock::new(Vec::new()),
 		}
 	}
-	let ping_time=tokio::time::Instant::now()-start_time;
-	(ping_time.as_millis() as u64,res.is_some())
+	pub(crate) async fn agent_ping(&self)->(u64,bool){
+		let start_time=tokio::time::Instant::now();
+		let res=self.send(RequestJob{
+			type_id:3,
+			localpath: None,
+		}).await;
+		let ping_time=tokio::time::Instant::now()-start_time;
+		(ping_time.as_millis() as u64,res.is_some())
+	}
+	pub async fn send(&self,job:RequestJob)->Option<AgentResult>{
+		//失敗した時はnoneを返す
+		let workers=self.workers.read().await;
+		//先頭のworkerから順に試行
+		for x in workers.iter(){
+			if let Ok(id)=x.send_request(&job).await{
+				if let Ok(res)=x.wait_by_id(id).await{
+					return Some(res);
+				}
+			}
+		}
+		None
+	}
+	pub(crate) async fn agent_worker(&self,(tcp,_addr):(TcpStream,SocketAddr)){
+		let a=Arc::new(AgentWorker::new(self.config.clone(),tcp));
+		self.workers.write().await.push(a.clone());
+		if let Err(e)=a.read_loop().await{
+			println!("exit agent session {}",e);
+		}
+		a.shutdown().await;
+	}
 }
-pub(crate) async fn agent_worker((tcp,_addr):(TcpStream,SocketAddr),mut recv_queue:Receiver<RequestJob>,config:Arc<ConfigFile>)->Receiver<RequestJob>{
-	println!("start agent session");
-	let id=AtomicU32::new(0);
-	async fn req(con:&mut OwnedWriteHalf,req:&RequestJob,id:u32)->Result<(),std::io::Error>{
+struct AgentWorker{
+	config: Arc<ConfigFile>,
+	reader: Mutex<OwnedReadHalf>,
+	writer: Mutex<OwnedWriteHalf>,
+	wait_list:Mutex<HashMap<u32,Sender<Option<AgentResult>>>>,
+	id: AtomicU32,
+}
+impl AgentWorker{
+	fn new(config:Arc<ConfigFile>,tcp: TcpStream)->Self{
+		let (reader,writer)=tcp.into_split();
+		let id=AtomicU32::new(0);
+		Self{
+			config,
+			reader:Mutex::new(reader),
+			writer:Mutex::new(writer),
+			wait_list:Mutex::new(HashMap::new()),
+			id,
+		}
+	}
+	async fn send_request(&self,req:&RequestJob)->Result<u32,std::io::Error>{
+		let mut con=self.writer.lock().await;
+		let id=self.id.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
 		con.write_u8(req.type_id).await?;//種別
 		con.write_u8(0u8).await?;//padding
 		con.write_u32(id).await?;//id
@@ -50,9 +80,31 @@ pub(crate) async fn agent_worker((tcp,_addr):(TcpStream,SocketAddr),mut recv_que
 			con.write_u16(0).await?;
 		}
 		con.flush().await?;
-		Ok(())
+		Ok(id)
 	}
-	async fn res(con:&mut OwnedReadHalf)->Result<AgentResult,std::io::Error>{
+	async fn wait_by_id(&self,id:u32)->Result<AgentResult,()>{
+		let (s,mut r)=tokio::sync::mpsc::channel(1);
+		self.wait_list.lock().await.insert(id,s.clone());
+		let timeout=self.config.agent_timeout;
+		tokio::runtime::Handle::current().spawn(async move{
+			tokio::time::sleep(tokio::time::Duration::from_millis(timeout)).await;
+			let _=s.send_timeout(None,tokio::time::Duration::from_millis(100)).await;
+		});
+		r.recv().await.unwrap_or(None).ok_or(())
+	}
+	async fn shutdown(&self){
+		self.wait_list.lock().await.clear();
+	}
+	async fn read_loop(&self)->Result<(),std::io::Error>{
+		loop{
+			let result=self.read_response().await?;
+			if let Some(t)=self.wait_list.lock().await.get(&result.id){
+				let _=t.send_timeout(Some(result),tokio::time::Duration::from_millis(100)).await;
+			}
+		}
+	}
+	async fn read_response(&self)->Result<AgentResult,std::io::Error>{
+		let mut con=self.reader.lock().await;
 		let status=con.read_u16().await?;
 		let id=con.read_u32().await?;
 		//println!("eventid {}",id);
@@ -73,77 +125,4 @@ pub(crate) async fn agent_worker((tcp,_addr):(TcpStream,SocketAddr),mut recv_que
 			json:s,
 		})
 	}
-	let working_buffer=Arc::new(Mutex::new(HashMap::new()));
-	let (mut reader,mut writer)=tcp.into_split();
-	let working_buffer0=working_buffer.clone();
-	let is_error=Arc::new(AtomicBool::new(false));
-	let is_error0=is_error.clone();
-	tokio::runtime::Handle::current().spawn(async move{
-		loop{
-			match res(&mut reader).await{
-				Ok(res)=>{
-					let id=res.id;
-					let sender:Option<Sender<AgentResult>>=working_buffer.lock().await.remove(&id);
-					match sender{
-						Some(sender)=>{
-							//println!("RESPONSE={:?}",res);
-							if let Err(e)=sender.send(res).await{
-								eprintln!("AgentResult SendError {}",e);
-							}
-						},
-						None=>{
-							eprintln!("Drop Agent Response {}",id);
-						}
-					}
-				},
-				Err(e)=>{
-					eprintln!("agent session error {:?}",e);
-					is_error0.store(true,std::sync::atomic::Ordering::Relaxed);
-					break;
-				}
-			}
-		}
-	});
-	loop{
-		let mut res=None;
-		loop{
-			if is_error.load(std::sync::atomic::Ordering::Relaxed){
-				break;
-			}
-			match recv_queue.try_recv(){
-				Ok(res0)=>{
-					res.replace(res0);
-					break;
-				},
-				Err(TryRecvError::Empty)=>{
-					//job wait
-					tokio::time::sleep(Duration::from_millis(config.agent_queue_send_poll.into())).await;
-				},
-				Err(TryRecvError::Disconnected)=>{
-					break;
-				}
-			}
-		}
-		if let Some(mut job)=res{
-			let id=id.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
-			if let Some(res)=job.result.take(){
-				working_buffer0.lock().await.insert(id,res);
-			}
-			if let Err(e)=req(&mut writer,&job,id).await{
-				eprintln!("agent session error {:?}",e);
-				match writer.shutdown().await{
-					Ok(_)=>{
-						println!("shutdown agent session");
-					},
-					Err(e)=>{
-						eprintln!("shutdown {:?}",e);
-					}
-				}
-			}
-		}else{
-			break;
-		}
-	}
-	println!("exit agent session");
-	return recv_queue;
 }

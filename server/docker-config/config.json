@@ -4,11 +4,7 @@
   "http_bind_addr": "0.0.0.0:8080",
   "agent_bind_addr": "0.0.0.0:23725",
   "ping_wait_ms": 0,
-  "ping_worker_timeout": 3000,
-  "ping_worker_poll": 5,
-  "http_agentwait_timeout": 3000,
-  "http_agentwait_poll": 5,
-  "agent_queue_send_poll": 5,
+  "agent_timeout":2000,
   "local_media_url":null,
   "user_agent": "https://github.com/yojo-art/files-proxy"
 }

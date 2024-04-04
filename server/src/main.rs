@@ -1,7 +1,7 @@
 use std::{io::Write, net::SocketAddr, sync::Arc, time::Duration};
 
+use agent::AgentJobManager;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{Receiver, Sender};
 mod commands;
 mod agent;
 mod http;
@@ -13,11 +13,7 @@ pub(crate) struct ConfigFile{
 	http_bind_addr:String,//0.0.0.0:8080
 	agent_bind_addr:String,//0.0.0.0:23725
 	ping_wait_ms:u64,//0でping無し 標準30000
-	ping_worker_timeout:u32,//3000
-	ping_worker_poll:u16,//5
-	http_agentwait_timeout:u32,//3000
-	http_agentwait_poll:u16,//5
-	agent_queue_send_poll:u16,//5
+	agent_timeout:u64,//1000
 	user_agent:Option<String>,
 	local_media_url:Option<String>,
 }
@@ -40,11 +36,7 @@ fn main() {
 			http_bind_addr: "0.0.0.0:8080".to_owned(),
 			agent_bind_addr: "0.0.0.0:23725".to_owned(),
 			ping_wait_ms: 30000,
-			ping_worker_timeout: 3000,
-			ping_worker_poll: 5,
-			http_agentwait_timeout: 3000,
-			http_agentwait_poll: 5,
-			agent_queue_send_poll: 5,
+			agent_timeout:1000,
 			user_agent: Some("https://github.com/yojo-art/files-proxy".to_owned()),
 			local_media_url:Some("http://localhost:3000".to_owned()),
 		};
@@ -59,15 +51,20 @@ fn main() {
 		return;
 	}
 	let config=Arc::new(config);
-	let (send_queue,recv_queue)=tokio::sync::mpsc::channel::<RequestJob>(4);
 	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-	async fn tcp_listener(config:Arc<ConfigFile>,mut recv_queue:Receiver<RequestJob>){
+	let job_manager=Arc::new(AgentJobManager::new(config.clone()));
+	async fn tcp_listener(config:Arc<ConfigFile>,job_manager: Arc<AgentJobManager>){
 		let tcp_addr:SocketAddr = config.agent_bind_addr.parse().unwrap();
 		match tokio::net::TcpListener::bind(tcp_addr).await{
 			Ok(con) => {
 				loop{
+					let job_manager=job_manager.clone();
 					let stream=con.accept().await;
-					recv_queue=agent::agent_worker(stream.unwrap(),recv_queue,config.clone()).await;
+					if let Ok(stream)=stream{
+						tokio::runtime::Handle::current().spawn(async move{
+							job_manager.agent_worker(stream).await
+						});
+					}
 				}
 			},
 			Err(e) => {
@@ -75,18 +72,17 @@ fn main() {
 			},
 		}
 	}
-	rt.spawn(tcp_listener(config.clone(),recv_queue));
-	let send_queue=Arc::new(send_queue);
+	rt.spawn(tcp_listener(config.clone(),job_manager.clone()));
 	if config.ping_wait_ms>0{
-		let send_queue0=send_queue.clone();
+		let send_queue0=job_manager.clone();
 		rt.spawn(ping_worker(send_queue0,config.clone()));
 	}
-	rt.block_on(http::http_server(send_queue,config));
+	rt.block_on(http::http_server(job_manager,config));
 }
-async fn ping_worker(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>){
+async fn ping_worker(send_queue: Arc<AgentJobManager>,config:Arc<ConfigFile>){
 	loop{
 		tokio::time::sleep(Duration::from_millis(config.ping_wait_ms)).await;
-		let (ping_time,is_ok)=agent::agent_ping(&send_queue,&config).await;
+		let (ping_time,is_ok)=send_queue.agent_ping().await;
 		let is_ok=if is_ok{"ok"}else{"error"};
 		println!("LastAgentPing {}ms {}",ping_time,is_ok);
 	}
@@ -94,7 +90,6 @@ async fn ping_worker(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 struct RequestJob{
 	type_id:u8,
 	localpath:Option<String>,
-	result:Option<Sender<AgentResult>>,
 }
 #[derive(Debug)]
 struct AgentResult{
