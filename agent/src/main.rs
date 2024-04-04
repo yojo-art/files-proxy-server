@@ -18,6 +18,7 @@ struct ConfigFile{
 pub struct DriveFile{
 	thumbnailAccessKey: String,
 	webpublicAccessKey: String,
+	isLink:bool,
 	src: Option<String>,
 }
 pub struct Request{
@@ -142,10 +143,9 @@ async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
 	let file = match req.request_type{
 		1=>{
 			let name=String::from_utf8_lossy(&req.body[2..]);
-			println!("name:{}",name);
 			sqlx::query_as::<_, DriveFile>(
 				"
-				SELECT \"thumbnailAccessKey\",\"webpublicAccessKey\",src
+				SELECT \"thumbnailAccessKey\",\"webpublicAccessKey\",\"isLink\",src
 				FROM drive_file
 				WHERE \"webpublicAccessKey\" = $1
 				",
@@ -155,10 +155,9 @@ async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
 		},
 		2=>{
 			let name=String::from_utf8_lossy(&req.body[2..]);
-			println!("name:{}",name);
 			sqlx::query_as::<_, DriveFile>(
 				"
-				SELECT \"thumbnailAccessKey\",\"webpublicAccessKey\",src
+				SELECT \"thumbnailAccessKey\",\"webpublicAccessKey\",\"isLink\",src
 				FROM drive_file
 				WHERE \"thumbnailAccessKey\" = $1
 				",
@@ -172,6 +171,18 @@ async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
 				id:req.id,
 				json:None,
 			}
+		},
+		4=>{
+			let name=String::from_utf8_lossy(&req.body[2..]);
+			sqlx::query_as::<_, DriveFile>(
+				"
+				SELECT \"thumbnailAccessKey\",\"webpublicAccessKey\",\"isLink\",src
+				FROM drive_file
+				WHERE \"accessKey\" = $1
+				",
+			)
+			.bind(name.as_ref())
+			.fetch_one(pool).await
 		},
 		_=>{
 			return Response{
@@ -204,11 +215,13 @@ async fn load_from_db(pool: &Pool<Postgres>,req:Request)->Response{
 #[derive(Serialize,Deserialize,Debug)]
 struct ResponseJson{
 	uri:String,
+	link:bool,
 }
 impl From<DriveFile> for ResponseJson{
 	fn from(value: DriveFile) -> Self {
 		Self{
 			uri:value.src.unwrap_or_else(||String::new()),
+			link:value.isLink,
 		}
 	}
 }
