@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Write, net::SocketAddr, sync::{atomic::{AtomicBool, AtomicU32}, Arc}, time::Duration};
+use std::{borrow::Cow, collections::HashMap, io::Write, net::SocketAddr, sync::{atomic::{AtomicBool, AtomicU32}, Arc}, time::Duration};
 
 use axum::{body::StreamBody, response::IntoResponse, routing::get, Router};
 use redis::Commands;
@@ -19,6 +19,7 @@ pub(crate) struct ConfigFile{
 	http_agentwait_poll:u16,//5
 	agent_queue_send_poll:u16,//5
 	user_agent:Option<String>,
+	local_media_url:Option<String>,
 }
 
 fn main() {
@@ -45,6 +46,7 @@ fn main() {
 			http_agentwait_poll: 5,
 			agent_queue_send_poll: 5,
 			user_agent: Some("https://github.com/yojo-art/files-proxy".to_owned()),
+			local_media_url:Some("http://localhost:3000".to_owned()),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -124,7 +126,7 @@ async fn agent_call(send_queue: Arc<Sender<RequestJob>>,config:&ConfigFile,path:
 	}else if path.starts_with("thumbnail-"){
 		2
 	}else{
-		return Err((axum::http::StatusCode::NOT_FOUND).into_response());
+		4
 	};
 	//println!("{}",path);
 	let (send_result,mut recv_result)=tokio::sync::mpsc::channel(1);
@@ -212,6 +214,7 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 		}else{
 			None
 		};
+		let redis_hit=json.is_some();
 		if json.is_none(){//redisキャッシュに無い
 			let res=match agent_call(send_queue,&config,path.clone()).await{
 				Ok(v) => v,
@@ -248,6 +251,11 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 				}
 			}
 			json=res_json;
+			if res.status==404{
+				let mut resp=(axum::http::StatusCode::NOT_FOUND).into_response();
+				resp.headers_mut().append("X-AgentStatus",res.status.to_string().parse().unwrap());
+				return Err(resp);
+			}
 			if res.status!=200{
 				let event_id=uuid::Uuid::new_v4().to_string();
 				eprintln!("EventId[{}] job Agent Status {}",event_id,res.status);
@@ -277,8 +285,17 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 				return Err(resp);
 			}
 		};
-		println!("GET {}",json.uri);
-		let request=client.get(&json.uri).build();
+		let url=if json.link{
+			Cow::Borrowed(&json.uri)
+		}else{
+			if let Some(local_media_url)=config.local_media_url.as_ref(){
+				Cow::Owned(format!("{}{}",local_media_url,path))
+			}else{
+				return Err((axum::http::StatusCode::NOT_FOUND).into_response());
+			}
+		};
+		println!("GET {}",url);
+		let request=client.get(url.as_ref()).build();
 		let mut request=match request{
 			Ok(request)=>request,
 			Err(e)=>return Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
@@ -301,8 +318,11 @@ async fn http_server(send_queue: Arc<Sender<RequestJob>>,config:Arc<ConfigFile>)
 		let status=resp.status();
 		let remote_headers=resp.headers();
 		let mut headers=axum::headers::HeaderMap::new();
-		headers.append("X-RemoteStatus",status.as_u16().to_string().parse().unwrap());
-		headers.append("X-RemoteURL",json.uri.parse().unwrap());
+		headers.append("X-FileProxy-Hit",redis_hit.to_string().parse().unwrap());
+		headers.append("X-Remote-Status",status.as_u16().to_string().parse().unwrap());
+		if json.link{
+			headers.append("X-Remote-Url",url.parse().unwrap());
+		}
 		headers.append("Vary","Origin".parse().unwrap());
 		fn add_remote_header(key:&'static str,headers:&mut axum::headers::HeaderMap,remote_headers:&reqwest::header::HeaderMap){
 			for v in remote_headers.get_all(key){
@@ -453,6 +473,7 @@ struct AgentResult{
 #[derive(Deserialize,Debug)]
 struct ResponseJson{
 	uri:String,
+	link:bool,
 }
 #[derive(Serialize,Deserialize,Debug)]
 pub(crate) struct PingStatus{
