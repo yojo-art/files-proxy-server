@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream}, sync::mpsc::{Receiver, Sender}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream}, sync::mpsc::{Receiver, Sender}};
 
 #[derive(Deserialize,Debug)]
 struct ConfigFile{
@@ -90,9 +90,11 @@ fn main() {
 	});
 }
 async fn tcp_worker(tcp:TcpStream,req_sender: Sender<Request>,res_sender: Sender<Response>,res_receiver: &mut Receiver<Response>){
-	let (mut reader,mut writer)=tcp.into_split();
+	let (reader,writer)=tcp.into_split();
+	let mut reader=BufReader::new(reader);
+	let mut writer=BufWriter::new(writer);
 	tokio::runtime::Handle::current().spawn(async move{
-		async fn read_request(reader: &mut OwnedReadHalf)->std::io::Result<Request>{
+		async fn read_request(reader: &mut BufReader<OwnedReadHalf>)->std::io::Result<Request>{
 			let request_type=reader.read_u8().await?;
 			let reserved=reader.read_u8().await?;
 			let id=reader.read_u32().await?;
@@ -126,7 +128,7 @@ async fn tcp_worker(tcp:TcpStream,req_sender: Sender<Request>,res_sender: Sender
 			if res.status==0{
 				break;
 			}
-			async fn write_response(writer: &mut OwnedWriteHalf,res: Response)->std::io::Result<()>{
+			async fn write_response(writer: &mut BufWriter<OwnedWriteHalf>,res: Response)->std::io::Result<()>{
 				writer.write_u16(res.status).await?;
 				writer.write_u32(res.id).await?;
 				if let Some(json)=res.json{
@@ -135,6 +137,7 @@ async fn tcp_worker(tcp:TcpStream,req_sender: Sender<Request>,res_sender: Sender
 				}else{
 					writer.write_u16(0u16).await?;
 				}
+				writer.flush().await?;
 				Ok(())
 			}
 			if let Err(e)=write_response(&mut writer,res).await{
