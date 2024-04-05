@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, sync::{atomic::AtomicU32, Arc}};
 
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream}, sync::{mpsc::Sender, Mutex, RwLock}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter}, net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream}, sync::{mpsc::Sender, Mutex, RwLock}};
 
 use crate::{AgentResult, ConfigFile, RequestJob};
 
@@ -48,14 +48,16 @@ impl AgentJobManager{
 }
 struct AgentWorker{
 	config: Arc<ConfigFile>,
-	reader: Mutex<OwnedReadHalf>,
-	writer: Mutex<OwnedWriteHalf>,
+	reader: Mutex<BufReader<OwnedReadHalf>>,
+	writer: Mutex<BufWriter<OwnedWriteHalf>>,
 	wait_list:Mutex<HashMap<u32,Sender<Option<AgentResult>>>>,
 	id: AtomicU32,
 }
 impl AgentWorker{
 	fn new(config:Arc<ConfigFile>,tcp: TcpStream)->Self{
 		let (reader,writer)=tcp.into_split();
+		let reader=BufReader::new(reader);
+		let writer=BufWriter::new(writer);
 		let id=AtomicU32::new(0);
 		Self{
 			config,
