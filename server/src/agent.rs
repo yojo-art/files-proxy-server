@@ -95,12 +95,14 @@ impl AgentWorker{
 		r.recv().await.unwrap_or(None).ok_or(())
 	}
 	async fn shutdown(&self){
-		self.wait_list.lock().await.clear();
+		for (_id,sender) in self.wait_list.lock().await.drain(){
+			let _=sender.send_timeout(None,tokio::time::Duration::from_millis(1)).await;
+		}
 	}
 	async fn read_loop(&self)->Result<(),std::io::Error>{
 		loop{
 			let result=self.read_response().await?;
-			if let Some(t)=self.wait_list.lock().await.get(&result.id){
+			if let Some(t)=self.wait_list.lock().await.remove(&result.id){
 				let _=t.send_timeout(Some(result),tokio::time::Duration::from_millis(100)).await;
 			}
 		}
