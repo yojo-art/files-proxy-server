@@ -62,14 +62,14 @@ async fn get_file(
 		None
 	};
 	let redis_hit=json.is_some();
+	let type_id=if path.starts_with("webpublic-"){
+		1
+	}else if path.starts_with("thumbnail-"){
+		2
+	}else{
+		4
+	};
 	if json.is_none(){//redisキャッシュに無い
-		let type_id=if path.starts_with("webpublic-"){
-			1
-		}else if path.starts_with("thumbnail-"){
-			2
-		}else{
-			4
-		};
 		//println!("{}",path);
 		let job=RequestJob{
 			type_id,
@@ -151,6 +151,16 @@ async fn get_file(
 		}
 	};
 	println!("GET {}",url);
+	let mut headers=axum::headers::HeaderMap::new();
+	headers.append("X-FileProxy-Hit",redis_hit.to_string().parse().unwrap());
+	if json.link{
+		headers.append("X-Remote-Url",url.parse().unwrap());
+	}
+	headers.append("Vary","Origin".parse().unwrap());
+	if type_id==2{
+		headers.append("Location",format!("{}static.webp?url={}&static=1",config.media_proxy_url,urlencoding::encode(&url)).parse().unwrap());
+		return Err((axum::http::StatusCode::MOVED_PERMANENTLY,headers,format!("")).into_response());
+	}
 	let request=client.get(url.as_ref()).build();
 	let mut request=match request{
 		Ok(request)=>request,
@@ -171,15 +181,9 @@ async fn get_file(
 		Ok(resp)=>resp,
 		Err(e)=>return Err((axum::http::StatusCode::BAD_GATEWAY,format!("{:?}",e)).into_response())
 	};
-	let status=resp.status();
 	let remote_headers=resp.headers();
-	let mut headers=axum::headers::HeaderMap::new();
-	headers.append("X-FileProxy-Hit",redis_hit.to_string().parse().unwrap());
+	let status=resp.status();
 	headers.append("X-Remote-Status",status.as_u16().to_string().parse().unwrap());
-	if json.link{
-		headers.append("X-Remote-Url",url.parse().unwrap());
-	}
-	headers.append("Vary","Origin".parse().unwrap());
 	fn add_remote_header(key:&'static str,headers:&mut axum::headers::HeaderMap,remote_headers:&reqwest::header::HeaderMap){
 		for v in remote_headers.get_all(key){
 			headers.append(key,String::from_utf8_lossy(v.as_bytes()).parse().unwrap());
