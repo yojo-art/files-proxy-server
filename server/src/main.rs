@@ -16,6 +16,7 @@ pub(crate) struct ConfigFile{
 	agent_timeout:u64,//1000
 	user_agent:Option<String>,
 	local_media_url:Option<String>,
+	media_proxy_url:String,
 }
 
 fn main() {
@@ -39,6 +40,7 @@ fn main() {
 			agent_timeout:1000,
 			user_agent: Some("https://github.com/yojo-art/files-proxy".to_owned()),
 			local_media_url:Some("http://localhost:3000".to_owned()),
+			media_proxy_url:"/proxy/".to_owned(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
