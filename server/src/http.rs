@@ -173,6 +173,12 @@ async fn get_file(
 	if let Some(modified_since)=headers.get("If-None-Match").map(|v|v.to_str().ok()).unwrap_or(None){
 		req_headers.append("If-None-Match",modified_since.parse().unwrap());
 	}
+	if let Some(modified_since)=headers.get("Range").map(|v|v.to_str().ok()).unwrap_or(None){
+		req_headers.append("Range",modified_since.parse().unwrap());
+	}
+	if let Some(modified_since)=headers.get("If-Range").map(|v|v.to_str().ok()).unwrap_or(None){
+		req_headers.append("If-Range",modified_since.parse().unwrap());
+	}
 	if let Some(user_agent)=config.user_agent.as_ref(){
 		req_headers.append("User-Agent",user_agent.parse().unwrap());
 	}
@@ -189,6 +195,9 @@ async fn get_file(
 			headers.append(key,String::from_utf8_lossy(v.as_bytes()).parse().unwrap());
 		}
 	}
+	add_remote_header("Content-Length",&mut headers,remote_headers);
+	add_remote_header("Content-Range",&mut headers,remote_headers);
+	add_remote_header("Accept-Ranges",&mut headers,remote_headers);
 	add_remote_header("Content-Disposition",&mut headers,remote_headers);
 	add_remote_header("Content-Security-Policy",&mut headers,remote_headers);
 	add_remote_header("Content-Type",&mut headers,remote_headers);
