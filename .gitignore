@@ -1,3 +1,5 @@
 server/target/*
 server/config.json
+Cargo.lock
+
 
