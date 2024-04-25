@@ -6,11 +6,9 @@ RUN mkdir /app
 WORKDIR /app
 COPY src ./src
 COPY Cargo.toml ./Cargo.toml
-COPY Cargo.lock ./Cargo.lock
-RUN --mount=type=cache,target=/var/cache/cargo cargo fetch --locked
 ENV RUSTC_WRAPPER=/usr/local/bin/sccache
 ENV SCCACHE_DIR=/var/cache/sccache
-RUN --mount=type=cache,target=/var/cache/cargo --mount=type=cache,target=/var/cache/sccache cargo build --target x86_64-unknown-linux-musl --release --offline
+RUN --mount=type=cache,target=/var/cache/cargo --mount=type=cache,target=/var/cache/sccache cargo build --target x86_64-unknown-linux-musl --release
 
 FROM alpine:latest
 ARG UID="850"
