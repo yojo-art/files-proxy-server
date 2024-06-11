@@ -6,7 +6,30 @@ use tokio::sync::Mutex;
 
 use crate::{agent::AgentJobManager, ConfigFile, PingStatus, RequestJob, ResponseJson};
 
+async fn shutdown_signal() {
+	use tokio::signal;
+	use futures::{future::FutureExt,pin_mut};
+	let ctrl_c = async {
+		signal::ctrl_c()
+			.await
+			.expect("failed to install Ctrl+C handler");
+	}.fuse();
 
+	#[cfg(unix)]
+	let terminate = async {
+		signal::unix::signal(signal::unix::SignalKind::terminate())
+			.expect("failed to install signal handler")
+			.recv()
+			.await;
+	}.fuse();
+	#[cfg(not(unix))]
+	let terminate = std::future::pending::<()>().fuse();
+	pin_mut!(ctrl_c, terminate);
+	futures::select!{
+		_ = ctrl_c => {},
+		_ = terminate => {},
+	}
+}
 pub(crate) async fn http_server(send_queue: Arc<AgentJobManager>,config:Arc<ConfigFile>){
 	let redis_client=if let Some(redis_addr)=config.redis_addr.as_ref(){
 		let redis_client=redis::Client::open(redis_addr.clone());
@@ -44,7 +67,7 @@ pub(crate) async fn http_server(send_queue: Arc<AgentJobManager>,config:Arc<Conf
 		header.insert("Content-Type","application/json".parse().unwrap());
 		(axum::http::StatusCode::OK,header,serde_json::to_string(&json).unwrap())
 	})).route("/*path",get(|path,headers|get_file(path, headers, client, send_queue, redis_client, config)));
-	axum::Server::bind(&http_addr).serve(app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+	axum::Server::bind(&http_addr).serve(app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
 }
 async fn get_file(
 	axum::extract::Path(path):axum::extract::Path<String>,
