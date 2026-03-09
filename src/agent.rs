@@ -118,20 +118,24 @@ impl AgentWorker {
 	}
 	async fn read_loop(&self) -> Result<(), std::io::Error> {
 		loop {
-			let result = self.read_response().await?;
-			if let Some(t) = self.wait_list.lock().await.remove(&result.id) {
-				let _ = t
-					.send_timeout(Some(result), tokio::time::Duration::from_millis(100))
-					.await;
+			if let Some(result) = self.read_response().await? {
+				if let Some(t) = self.wait_list.lock().await.remove(&result.id) {
+					let _ = t
+						.send_timeout(Some(result), tokio::time::Duration::from_millis(100))
+						.await;
+				}
 			}
 		}
 	}
-	async fn read_response(&self) -> Result<AgentResult, std::io::Error> {
+	async fn read_response(&self) -> Result<Option<AgentResult>, std::io::Error> {
 		let mut con = self.reader.lock().await;
 		let status = con.read_u16().await?;
 		let id = con.read_u32().await?;
 		//println!("eventid {}",id);
 		let len = con.read_u16().await? as usize;
+		if status == 100 {
+			return Ok(None);
+		}
 		let s = if len > 0 {
 			let mut buf = vec![0; len];
 			con.read_exact(&mut buf).await?;
@@ -141,10 +145,10 @@ impl AgentWorker {
 		} else {
 			None
 		};
-		Ok(AgentResult {
+		Ok(Some(AgentResult {
 			id,
 			status,
 			json: s,
-		})
+		}))
 	}
 }
